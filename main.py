@@ -32,6 +32,29 @@ a2a = APIRouter(prefix="/a2a")
 REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG_PATH", "./request_log.json")
 
 
+def summarize_for_log(text, max_len=6000):
+    """Truncate huge bodies, but for our own task-response shape, strip the
+    bulky document text out of history first so id/status/artifacts (the
+    fields we actually need to debug) always survive truncation."""
+    if not isinstance(text, str) or len(text) <= max_len:
+        return text
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "task" in parsed and isinstance(parsed["task"], dict):
+            task = dict(parsed["task"])
+            history = task.get("history")
+            if isinstance(history, list):
+                task["history"] = f"<{len(history)} history message(s) omitted for log size>"
+            parsed = {"task": task}
+            compact = json.dumps(parsed)
+            if len(compact) <= max_len:
+                return compact
+            return compact[:max_len] + "...<truncated>"
+    except Exception:
+        pass
+    return text[:max_len] + "...<truncated>"
+
+
 def log_request(method, path, headers, req_body, status_code, resp_body):
     try:
         try:
@@ -45,9 +68,9 @@ def log_request(method, path, headers, req_body, status_code, resp_body):
             "method": method,
             "path": path,
             "headers": safe_headers,
-            "req_body": req_body[:3000] if isinstance(req_body, str) else req_body,
+            "req_body": summarize_for_log(req_body),
             "status_code": status_code,
-            "resp_body": resp_body[:3000] if isinstance(resp_body, str) else resp_body,
+            "resp_body": summarize_for_log(resp_body),
         })
         log = log[-40:]
         with open(REQUEST_LOG_PATH, "w") as f:
@@ -357,7 +380,6 @@ def build_task_response(row):
             "state": row["state"],
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["updated_at"])),
         },
-        "state": row["state"],  # kept alongside status.state in case a checker reads either shape
         "history": history,
         "artifacts": artifacts,
     }}
@@ -644,4 +666,4 @@ def debug_requests(secret: Optional[str] = None):
         return []
 
 
-app.include_router(a2a)
+app.include_router(a2a) 
