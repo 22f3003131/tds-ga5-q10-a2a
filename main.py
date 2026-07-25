@@ -284,16 +284,26 @@ def get_decisions_with_cache(conn, packages, policy_revision):
 def build_task_response(row):
     history = json.loads(row["history"])
     artifacts_raw = json.loads(row["artifacts"])
-    parts = []
-    for a in artifacts_raw:
-        mt = PROPOSAL_MEDIA if "proposals" in a else RECEIPT_MEDIA
-        parts.append({"parts": [{"mediaType": mt, "data": a}]})
+    artifacts = []
+    for i, a in enumerate(artifacts_raw):
+        is_proposal = "proposals" in a
+        mt = PROPOSAL_MEDIA if is_proposal else RECEIPT_MEDIA
+        artifact_id = f"{row['id']}-artifact-{i}"
+        artifacts.append({
+            "artifactId": artifact_id,
+            "name": "invoice-action-proposals" if is_proposal else "invoice-action-receipts",
+            "parts": [{"mediaType": mt, "data": a}],
+        })
     return {"task": {
         "id": row["id"],
         "contextId": row["context_id"],
-        "state": row["state"],
+        "status": {
+            "state": row["state"],
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["updated_at"])),
+        },
+        "state": row["state"],  # kept alongside status.state in case a checker reads either shape
         "history": history,
-        "artifacts": parts,
+        "artifacts": artifacts,
     }}
 
 
