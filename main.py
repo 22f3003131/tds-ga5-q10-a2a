@@ -20,14 +20,15 @@ import uuid
 import hashlib
 import sqlite3
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Header, Depends
+from fastapi import FastAPI, APIRouter, Request, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
 
 app = FastAPI()
+a2a = APIRouter(prefix="/a2a")
 
 DB_PATH = os.environ.get("DB_PATH", "./a2a.db")
-BASE_URL = os.environ.get("BASE_URL", "https://your-app.onrender.com/a2a/")
+BASE_URL = os.environ.get("BASE_URL", "https://tds-ga5-q10-a2a.onrender.com/a2a/")
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
 
 VALID_ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
@@ -317,7 +318,7 @@ def handle_result_continuation(conn, principal, message, data, task_id, context_
     return build_task_response(row2)
 
 
-@app.post("/message:send")
+@a2a.post("/message:send")
 async def message_send(request: Request, principal: str = Depends(get_principal), _=Depends(check_version)):
     content_type = request.headers.get("content-type", "")
     if "json" not in content_type:
@@ -383,7 +384,7 @@ async def message_send(request: Request, principal: str = Depends(get_principal)
 
 # ---------------- task read / list / cancel ----------------
 
-@app.get("/tasks/{task_id}")
+@a2a.get("/tasks/{task_id}")
 def get_task(task_id: str, principal: str = Depends(get_principal), _=Depends(check_version)):
     conn = get_db()
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -393,7 +394,7 @@ def get_task(task_id: str, principal: str = Depends(get_principal), _=Depends(ch
     return JSONResponse(content=build_task_response(row), media_type="application/a2a+json")
 
 
-@app.get("/tasks")
+@a2a.get("/tasks")
 def list_tasks(principal: str = Depends(get_principal), _=Depends(check_version)):
     conn = get_db()
     rows = conn.execute("SELECT * FROM tasks WHERE principal=?", (principal,)).fetchall()
@@ -404,7 +405,7 @@ def list_tasks(principal: str = Depends(get_principal), _=Depends(check_version)
     )
 
 
-@app.post("/tasks/{task_id}:cancel")
+@a2a.post("/tasks/{task_id}:cancel")
 def cancel_task(task_id: str, principal: str = Depends(get_principal), _=Depends(check_version)):
     conn = get_db()
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -429,3 +430,6 @@ def cancel_task(task_id: str, principal: str = Depends(get_principal), _=Depends
     row2 = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     conn.close()
     return JSONResponse(content=build_task_response(row2), media_type="application/a2a+json")
+
+
+app.include_router(a2a)
