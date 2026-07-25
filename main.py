@@ -29,85 +29,6 @@ from typing import Optional
 app = FastAPI()
 a2a = APIRouter(prefix="/a2a")
 
-REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG_PATH", "./request_log.json")
-
-
-def summarize_for_log(text, max_len=6000):
-    """Truncate huge bodies, but for our own task-response shape, strip the
-    bulky document text out of history first so id/status/artifacts (the
-    fields we actually need to debug) always survive truncation."""
-    if not isinstance(text, str) or len(text) <= max_len:
-        return text
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict) and "task" in parsed and isinstance(parsed["task"], dict):
-            task = dict(parsed["task"])
-            history = task.get("history")
-            if isinstance(history, list):
-                task["history"] = f"<{len(history)} history message(s) omitted for log size>"
-            parsed = {"task": task}
-            compact = json.dumps(parsed)
-            if len(compact) <= max_len:
-                return compact
-            return compact[:max_len] + "...<truncated>"
-    except Exception:
-        pass
-    return text[:max_len] + "...<truncated>"
-
-
-def log_request(method, path, headers, req_body, status_code, resp_body):
-    try:
-        try:
-            with open(REQUEST_LOG_PATH) as f:
-                log = json.load(f)
-        except Exception:
-            log = []
-        safe_headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization",)}
-        log.append({
-            "time": time.time(),
-            "method": method,
-            "path": path,
-            "headers": safe_headers,
-            "req_body": summarize_for_log(req_body),
-            "status_code": status_code,
-            "resp_body": summarize_for_log(resp_body),
-        })
-        log = log[-40:]
-        with open(REQUEST_LOG_PATH, "w") as f:
-            json.dump(log, f)
-    except Exception:
-        pass
-
-
-@app.middleware("http")
-async def request_logging_middleware(request: Request, call_next):
-    body_bytes = await request.body()
-
-    async def receive():
-        return {"type": "http.request", "body": body_bytes, "more_body": False}
-    request._receive = receive
-
-    response = await call_next(request)
-
-    resp_body_chunks = [chunk async for chunk in response.body_iterator]
-    resp_body_bytes = b"".join(resp_body_chunks)
-
-    async def new_body_iterator():
-        yield resp_body_bytes
-    response.body_iterator = new_body_iterator()
-
-    try:
-        req_text = body_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        req_text = "<binary>"
-    try:
-        resp_text = resp_body_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        resp_text = "<binary>"
-
-    log_request(request.method, request.url.path, dict(request.headers), req_text, response.status_code, resp_text)
-    return response
-
 # Per-(principal, messageId) locks: closes the check-then-act race where two
 # truly concurrent identical requests could both see "no existing record yet"
 # and each create their own task for the same messageId.
@@ -364,22 +285,13 @@ def build_task_response(row):
     history = json.loads(row["history"])
     artifacts_raw = json.loads(row["artifacts"])
     artifacts = []
-    for i, a in enumerate(artifacts_raw):
-        is_proposal = "proposals" in a
-        mt = PROPOSAL_MEDIA if is_proposal else RECEIPT_MEDIA
-        artifact_id = f"{row['id']}-artifact-{i}"
-        artifacts.append({
-            "artifactId": artifact_id,
-            "name": "invoice-action-proposals" if is_proposal else "invoice-action-receipts",
-            "parts": [{"mediaType": mt, "data": a}],
-        })
+    for a in artifacts_raw:
+        mt = PROPOSAL_MEDIA if "proposals" in a else RECEIPT_MEDIA
+        artifacts.append({"parts": [{"mediaType": mt, "data": a}]})
     return {"task": {
         "id": row["id"],
         "contextId": row["context_id"],
-        "status": {
-            "state": row["state"],
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["updated_at"])),
-        },
+        "state": row["state"],
         "history": history,
         "artifacts": artifacts,
     }}
@@ -655,15 +567,4 @@ def debug_events(secret: Optional[str] = None):
         return []
 
 
-@app.get("/debug/requests")
-def debug_requests(secret: Optional[str] = None):
-    if secret != DEBUG_SECRET:
-        raise HTTPException(status_code=404)
-    try:
-        with open(REQUEST_LOG_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-app.include_router(a2a) 
+app.include_router(a2a)  
