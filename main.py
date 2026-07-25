@@ -29,6 +29,62 @@ from typing import Optional
 app = FastAPI()
 a2a = APIRouter(prefix="/a2a")
 
+REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG_PATH", "./request_log.json")
+
+
+def log_request(method, path, headers, req_body, status_code, resp_body):
+    try:
+        try:
+            with open(REQUEST_LOG_PATH) as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+        safe_headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization",)}
+        log.append({
+            "time": time.time(),
+            "method": method,
+            "path": path,
+            "headers": safe_headers,
+            "req_body": req_body[:3000] if isinstance(req_body, str) else req_body,
+            "status_code": status_code,
+            "resp_body": resp_body[:3000] if isinstance(resp_body, str) else resp_body,
+        })
+        log = log[-40:]
+        with open(REQUEST_LOG_PATH, "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    body_bytes = await request.body()
+
+    async def receive():
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
+    request._receive = receive
+
+    response = await call_next(request)
+
+    resp_body_chunks = [chunk async for chunk in response.body_iterator]
+    resp_body_bytes = b"".join(resp_body_chunks)
+
+    async def new_body_iterator():
+        yield resp_body_bytes
+    response.body_iterator = new_body_iterator()
+
+    try:
+        req_text = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        req_text = "<binary>"
+    try:
+        resp_text = resp_body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        resp_text = "<binary>"
+
+    log_request(request.method, request.url.path, dict(request.headers), req_text, response.status_code, resp_text)
+    return response
+
 # Per-(principal, messageId) locks: closes the check-then-act race where two
 # truly concurrent identical requests could both see "no existing record yet"
 # and each create their own task for the same messageId.
@@ -572,6 +628,17 @@ def debug_events(secret: Optional[str] = None):
         raise HTTPException(status_code=404)
     try:
         with open(EVENT_LOG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+@app.get("/debug/requests")
+def debug_requests(secret: Optional[str] = None):
+    if secret != DEBUG_SECRET:
+        raise HTTPException(status_code=404)
+    try:
+        with open(REQUEST_LOG_PATH) as f:
             return json.load(f)
     except Exception:
         return []
