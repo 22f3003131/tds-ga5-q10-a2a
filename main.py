@@ -90,6 +90,7 @@ def init_db():
         message_hash TEXT,
         response TEXT,
         status_code INTEGER,
+        task_id TEXT,
         PRIMARY KEY (principal, message_id)
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS package_cache (
@@ -156,11 +157,16 @@ def agent_card():
 
 def build_prompt(packages, policy_revision) -> str:
     actions_desc = (
-        "settle_invoice: valid, reconciled, and within autonomous authority.\n"
-        "request_approval: commercially valid, but outside delegated authority.\n"
-        "hold_invoice: payment pauses until a stated verification completes.\n"
-        "reject_duplicate: the same commercial invoice was already paid.\n"
-        "open_exception: material records conflict and need an exception workflow."
+        "settle_invoice: valid, reconciled, AND within autonomous authority. Only choose this if the "
+        "package explicitly confirms all three — validity, reconciliation, AND that the amount/vendor "
+        "is within the stated autonomous limit.\n"
+        "request_approval: commercially valid, but outside delegated authority (e.g. exceeds an "
+        "autonomous threshold, or authority is not confirmed).\n"
+        "hold_invoice: payment must pause because a stated verification, confirmation, or check is "
+        "pending/incomplete.\n"
+        "reject_duplicate: the package states this same commercial invoice was already paid/settled.\n"
+        "open_exception: material records conflict (e.g. mismatched amounts, vendor, PO, or dates "
+        "between two current — not archived — statements) requiring manual exception handling."
     )
     return (
         "You are an invoice-review agent. For EACH package below, choose exactly one action "
@@ -170,6 +176,12 @@ def build_prompt(packages, policy_revision) -> str:
         "the correct action) with distractors: archived/old examples, negated statements, cover-sheet "
         "summaries, and irrelevant action words. You MUST base the decision only on the controlling "
         "statements, never on archived examples, negated claims, or the cover sheet.\n\n"
+        "IMPORTANT — do not default to settle_invoice. Treat it as the exception, not the default: only "
+        "choose it when the text explicitly and currently confirms validity, reconciliation, AND "
+        "in-authority status together. If any one of those three is missing, unclear, negated, or only "
+        "true in an archived/old example, choose request_approval, hold_invoice, reject_duplicate, or "
+        "open_exception instead, whichever the controlling statement actually supports. Settling a "
+        "package that should have been approved, held, rejected, or escalated is a serious error.\n\n"
         "Return strict JSON: {\"decisions\": [{\"packageId\": str, \"action\": str, "
         "\"facts\": {\"vendorName\": str, \"invoiceNumber\": str, \"amountMinor\": int, \"currency\": str}, "
         "\"evidenceRefs\": [str, str, ...], \"rationale\": str}]}\n"
@@ -311,12 +323,27 @@ def handle_result_continuation(conn, principal, message, data, task_id, context_
 
     proposal_by_key = {(p["packageId"], p["actionId"]): p for p in stored_artifact["proposals"]}
 
-    executions = []
+    # Validate EVERY result BEFORE any mutation. A continuation referencing an
+    # unknown package/action, a mismatched action, or an ACCEPTED outcome with
+    # no receipt nonce is rejected wholesale rather than silently dropped.
     for r in results:
         key = (r.get("packageId"), r.get("actionId"))
         proposal = proposal_by_key.get(key)
-        if not proposal or proposal["action"] != r.get("action") or r.get("outcome") != "ACCEPTED":
-            continue  # reject / mismatch: never executed
+        if not proposal:
+            raise HTTPException(status_code=400, detail="Result references unknown package/action")
+        if proposal["action"] != r.get("action"):
+            raise HTTPException(status_code=400, detail="Result action does not match stored proposal")
+        if r.get("outcome") not in ("ACCEPTED", "REJECTED"):
+            raise HTTPException(status_code=400, detail="Invalid outcome value")
+        if r.get("outcome") == "ACCEPTED" and not r.get("receiptNonce"):
+            raise HTTPException(status_code=400, detail="ACCEPTED result missing receiptNonce")
+
+    executions = []
+    for r in results:
+        key = (r.get("packageId"), r.get("actionId"))
+        proposal = proposal_by_key[key]
+        if r.get("outcome") != "ACCEPTED":
+            continue  # validated REJECTED entries stay out of executions, never run
         executions.append({
             "packageId": proposal["packageId"],
             "actionId": proposal["actionId"],
@@ -347,12 +374,17 @@ def handle_result_continuation(conn, principal, message, data, task_id, context_
 
 
 @a2a.post("/message:send")
-async def message_send(request: Request, principal: str = Depends(get_principal), _=Depends(check_version)):
+def message_send(request: Request, body: dict, principal: str = Depends(get_principal), _=Depends(check_version)):
+    # NOTE: this is a sync ("def", not "async def") route on purpose. FastAPI
+    # runs sync routes in a threadpool, so the blocking httpx.post() call to
+    # the AI provider below does NOT block the single asyncio event loop —
+    # other concurrent requests (a cancel racing a result, a different
+    # principal's isolation check, a rapid duplicate-messageId conflict test)
+    # can still be serviced while this one is mid-flight.
     content_type = request.headers.get("content-type", "")
     if not content_type.split(";")[0].strip().lower() == "application/a2a+json":
         raise HTTPException(status_code=400, detail="Content-Type must be application/a2a+json")
 
-    body = await request.json()
     message = body.get("message", {})
     message_id = message.get("messageId")
     role = message.get("role")
@@ -376,6 +408,15 @@ async def message_send(request: Request, principal: str = Depends(get_principal)
         if existing["message_hash"] != msg_hash:
             conn.close()
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+        # Rebuild from CURRENT stored state rather than replaying a frozen
+        # response — e.g. if the task has since completed, replay of the
+        # original messageId should reflect that, not the old INPUT_REQUIRED
+        # snapshot, while still doing no model call or re-execution.
+        if existing["status_code"] == 200 and existing["task_id"]:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (existing["task_id"],)).fetchone()
+            conn.close()
+            if row:
+                return JSONResponse(content=build_task_response(row), media_type="application/a2a+json")
         resp = JSONResponse(
             content=json.loads(existing["response"]),
             status_code=existing["status_code"],
@@ -394,8 +435,8 @@ async def message_send(request: Request, principal: str = Depends(get_principal)
     except HTTPException as e:
         body_out = {"error": str(e.detail)}
         conn.execute(
-            "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?)",
-            (principal, message_id, msg_hash, json.dumps(body_out), e.status_code),
+            "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?,?)",
+            (principal, message_id, msg_hash, json.dumps(body_out), e.status_code, None),
         )
         conn.commit()
         conn.close()
@@ -405,9 +446,10 @@ async def message_send(request: Request, principal: str = Depends(get_principal)
         conn.close()
         raise HTTPException(status_code=500, detail="Internal error processing message")
 
+    result_task_id = result.get("task", {}).get("id")
     conn.execute(
-        "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?)",
-        (principal, message_id, msg_hash, json.dumps(result), 200),
+        "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?,?)",
+        (principal, message_id, msg_hash, json.dumps(result), 200, result_task_id),
     )
     conn.commit()
     conn.close()
