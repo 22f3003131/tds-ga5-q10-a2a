@@ -21,12 +21,28 @@ import hashlib
 import sqlite3
 import httpx
 import traceback
+import threading
 from fastapi import FastAPI, APIRouter, Request, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
 
 app = FastAPI()
 a2a = APIRouter(prefix="/a2a")
+
+# Per-(principal, messageId) locks: closes the check-then-act race where two
+# truly concurrent identical requests could both see "no existing record yet"
+# and each create their own task for the same messageId.
+_message_locks = {}
+_message_locks_guard = threading.Lock()
+
+
+def get_message_lock(key):
+    with _message_locks_guard:
+        lock = _message_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _message_locks[key] = lock
+        return lock
 
 DEBUG_SECRET = os.environ.get("DEBUG_SECRET", "letmein")
 ERROR_LOG_PATH = os.environ.get("ERROR_LOG_PATH", "./error_log.json")
@@ -51,6 +67,24 @@ def log_error(context: str, exc: Exception, extra: dict = None):
             json.dump(log, f)
     except Exception:
         pass  # never let logging itself break the response
+
+
+EVENT_LOG_PATH = os.environ.get("EVENT_LOG_PATH", "./event_log.json")
+
+
+def log_event(context: str, extra: dict = None):
+    try:
+        try:
+            with open(EVENT_LOG_PATH) as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+        log.append({"time": time.time(), "context": context, "extra": extra or {}})
+        log = log[-50:]
+        with open(EVENT_LOG_PATH, "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
 
 DB_PATH = os.environ.get("DB_PATH", "./a2a.db")
 BASE_URL = os.environ.get("BASE_URL", "https://tds-ga5-q10-a2a.onrender.com/a2a/")
@@ -196,6 +230,7 @@ def build_prompt(packages, policy_revision) -> str:
 
 def get_ai_decisions_batch(packages, policy_revision):
     prompt = build_prompt(packages, policy_revision)
+    t0 = time.time()
     resp = httpx.post(
         "https://aipipe.org/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
@@ -204,8 +239,10 @@ def get_ai_decisions_batch(packages, policy_revision):
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         },
-        timeout=40,
+        timeout=30,
     )
+    elapsed = time.time() - t0
+    log_event("ai_call_timing", {"num_packages": len(packages), "seconds": round(elapsed, 2)})
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     parsed = json.loads(content)
@@ -400,60 +437,62 @@ def message_send(request: Request, body: dict, principal: str = Depends(get_prin
     data = part.get("data", {})
     msg_hash = hash_json(message)
 
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT * FROM idempotency WHERE principal=? AND message_id=?", (principal, message_id)
-    ).fetchone()
-    if existing:
-        if existing["message_hash"] != msg_hash:
+    lock = get_message_lock((principal, message_id))
+    with lock:
+        conn = get_db()
+        existing = conn.execute(
+            "SELECT * FROM idempotency WHERE principal=? AND message_id=?", (principal, message_id)
+        ).fetchone()
+        if existing:
+            if existing["message_hash"] != msg_hash:
+                conn.close()
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            # Rebuild from CURRENT stored state rather than replaying a frozen
+            # response — e.g. if the task has since completed, replay of the
+            # original messageId should reflect that, not the old INPUT_REQUIRED
+            # snapshot, while still doing no model call or re-execution.
+            if existing["status_code"] == 200 and existing["task_id"]:
+                row = conn.execute("SELECT * FROM tasks WHERE id=?", (existing["task_id"],)).fetchone()
+                conn.close()
+                if row:
+                    return JSONResponse(content=build_task_response(row), media_type="application/a2a+json")
+            resp = JSONResponse(
+                content=json.loads(existing["response"]),
+                status_code=existing["status_code"],
+                media_type="application/a2a+json",
+            )
             conn.close()
-            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-        # Rebuild from CURRENT stored state rather than replaying a frozen
-        # response — e.g. if the task has since completed, replay of the
-        # original messageId should reflect that, not the old INPUT_REQUIRED
-        # snapshot, while still doing no model call or re-execution.
-        if existing["status_code"] == 200 and existing["task_id"]:
-            row = conn.execute("SELECT * FROM tasks WHERE id=?", (existing["task_id"],)).fetchone()
-            conn.close()
-            if row:
-                return JSONResponse(content=build_task_response(row), media_type="application/a2a+json")
-        resp = JSONResponse(
-            content=json.loads(existing["response"]),
-            status_code=existing["status_code"],
-            media_type="application/a2a+json",
-        )
-        conn.close()
-        return resp
+            return resp
 
-    try:
-        if media_type == BATCH_MEDIA:
-            result = handle_initial_batch(conn, principal, message, data)
-        elif media_type == RESULTS_MEDIA:
-            result = handle_result_continuation(conn, principal, message, data, task_id, context_id)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported mediaType")
-    except HTTPException as e:
-        body_out = {"error": str(e.detail)}
+        try:
+            if media_type == BATCH_MEDIA:
+                result = handle_initial_batch(conn, principal, message, data)
+            elif media_type == RESULTS_MEDIA:
+                result = handle_result_continuation(conn, principal, message, data, task_id, context_id)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported mediaType")
+        except HTTPException as e:
+            body_out = {"error": str(e.detail)}
+            conn.execute(
+                "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?,?)",
+                (principal, message_id, msg_hash, json.dumps(body_out), e.status_code, None),
+            )
+            conn.commit()
+            conn.close()
+            raise
+        except Exception as e:
+            log_error("message_send", e, {"media_type": media_type, "message_id": message_id})
+            conn.close()
+            raise HTTPException(status_code=500, detail="Internal error processing message")
+
+        result_task_id = result.get("task", {}).get("id")
         conn.execute(
             "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?,?)",
-            (principal, message_id, msg_hash, json.dumps(body_out), e.status_code, None),
+            (principal, message_id, msg_hash, json.dumps(result), 200, result_task_id),
         )
         conn.commit()
         conn.close()
-        raise
-    except Exception as e:
-        log_error("message_send", e, {"media_type": media_type, "message_id": message_id})
-        conn.close()
-        raise HTTPException(status_code=500, detail="Internal error processing message")
-
-    result_task_id = result.get("task", {}).get("id")
-    conn.execute(
-        "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?,?)",
-        (principal, message_id, msg_hash, json.dumps(result), 200, result_task_id),
-    )
-    conn.commit()
-    conn.close()
-    return JSONResponse(content=result, media_type="application/a2a+json")
+        return JSONResponse(content=result, media_type="application/a2a+json")
 
 
 # ---------------- task read / list / cancel ----------------
@@ -512,6 +551,17 @@ def debug_errors(secret: Optional[str] = None):
         raise HTTPException(status_code=404)
     try:
         with open(ERROR_LOG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+@app.get("/debug/events")
+def debug_events(secret: Optional[str] = None):
+    if secret != DEBUG_SECRET:
+        raise HTTPException(status_code=404)
+    try:
+        with open(EVENT_LOG_PATH) as f:
             return json.load(f)
     except Exception:
         return []
