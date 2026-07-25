@@ -287,7 +287,7 @@ def build_task_response(row):
     artifacts = []
     for a in artifacts_raw:
         mt = PROPOSAL_MEDIA if "proposals" in a else RECEIPT_MEDIA
-        artifacts.append({"mediaType": mt, "data": a})
+        artifacts.append({"parts": [{"mediaType": mt, "data": a}]})
     return {"task": {
         "id": row["id"],
         "contextId": row["context_id"],
@@ -567,4 +567,4 @@ def debug_events(secret: Optional[str] = None):
         return []
 
 
-app.include_router(a2a)  
+app.include_router(a2a)
