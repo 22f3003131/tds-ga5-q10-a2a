@@ -20,12 +20,37 @@ import uuid
 import hashlib
 import sqlite3
 import httpx
+import traceback
 from fastapi import FastAPI, APIRouter, Request, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
 
 app = FastAPI()
 a2a = APIRouter(prefix="/a2a")
+
+DEBUG_SECRET = os.environ.get("DEBUG_SECRET", "letmein")
+ERROR_LOG_PATH = os.environ.get("ERROR_LOG_PATH", "./error_log.json")
+
+
+def log_error(context: str, exc: Exception, extra: dict = None):
+    try:
+        try:
+            with open(ERROR_LOG_PATH) as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+        log.append({
+            "time": time.time(),
+            "context": context,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "extra": extra or {},
+        })
+        log = log[-30:]
+        with open(ERROR_LOG_PATH, "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass  # never let logging itself break the response
 
 DB_PATH = os.environ.get("DB_PATH", "./a2a.db")
 BASE_URL = os.environ.get("BASE_URL", "https://tds-ga5-q10-a2a.onrender.com/a2a/")
@@ -141,15 +166,18 @@ def build_prompt(packages, policy_revision) -> str:
         "You are an invoice-review agent. For EACH package below, choose exactly one action "
         f"from this list:\n{actions_desc}\n\n"
         f"Policy revision: {policy_revision}\n\n"
-        "Documents mix useful facts with old/archived examples, negated statements, and irrelevant "
-        "action words meant to mislead. Base the decision only on the CURRENT, decisive statement in "
-        "each package, not on cover-sheet references, archived examples, or training decoys.\n\n"
+        "Each package mixes CONTROLLING facts (the current, decisive statements that determine "
+        "the correct action) with distractors: archived/old examples, negated statements, cover-sheet "
+        "summaries, and irrelevant action words. You MUST base the decision only on the controlling "
+        "statements, never on archived examples, negated claims, or the cover sheet.\n\n"
         "Return strict JSON: {\"decisions\": [{\"packageId\": str, \"action\": str, "
         "\"facts\": {\"vendorName\": str, \"invoiceNumber\": str, \"amountMinor\": int, \"currency\": str}, "
         "\"evidenceRefs\": [str, str, ...], \"rationale\": str}]}\n"
-        "evidenceRefs must be the exact bracketed references copied verbatim from the decisive "
-        "sentence(s) that determined the action (2+ refs). rationale must be 60-1500 characters and "
-        "name the chosen action.\n\n"
+        "evidenceRefs: return the exact bracketed reference IDs (e.g. [Section 3.2]) copied verbatim "
+        "from the controlling sentence(s) — at least two, and only ones that actually determine the "
+        "action (never the cover-sheet reference or an archived-example reference).\n"
+        "rationale: 60-1500 characters. Name the chosen action explicitly and explain, referencing the "
+        "evidenceRefs, how each piece of cited evidence supports that specific action.\n\n"
         f"Packages:\n{json.dumps(packages, indent=None)}"
     )
 
@@ -321,8 +349,8 @@ def handle_result_continuation(conn, principal, message, data, task_id, context_
 @a2a.post("/message:send")
 async def message_send(request: Request, principal: str = Depends(get_principal), _=Depends(check_version)):
     content_type = request.headers.get("content-type", "")
-    if "json" not in content_type:
-        raise HTTPException(status_code=400, detail="Unsupported media type")
+    if not content_type.split(";")[0].strip().lower() == "application/a2a+json":
+        raise HTTPException(status_code=400, detail="Content-Type must be application/a2a+json")
 
     body = await request.json()
     message = body.get("message", {})
@@ -372,6 +400,10 @@ async def message_send(request: Request, principal: str = Depends(get_principal)
         conn.commit()
         conn.close()
         raise
+    except Exception as e:
+        log_error("message_send", e, {"media_type": media_type, "message_id": message_id})
+        conn.close()
+        raise HTTPException(status_code=500, detail="Internal error processing message")
 
     conn.execute(
         "INSERT OR REPLACE INTO idempotency VALUES (?,?,?,?,?)",
@@ -430,6 +462,17 @@ def cancel_task(task_id: str, principal: str = Depends(get_principal), _=Depends
     row2 = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     conn.close()
     return JSONResponse(content=build_task_response(row2), media_type="application/a2a+json")
+
+
+@app.get("/debug/errors")
+def debug_errors(secret: Optional[str] = None):
+    if secret != DEBUG_SECRET:
+        raise HTTPException(status_code=404)
+    try:
+        with open(ERROR_LOG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 app.include_router(a2a)

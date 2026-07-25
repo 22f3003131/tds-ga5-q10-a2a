@@ -1,0 +1,29 @@
+{
+  "message": {
+    "messageId": "test-msg-001",
+    "role": "ROLE_USER",
+    "parts": [{
+      "mediaType": "application/vnd.ga5.invoice-claim-batch+json",
+      "data": {
+        "batchId": "test-batch-001",
+        "policyRevision": "v1",
+        "packages": [{
+          "packageId": "pkg-001",
+          "vendorName": "Acme Supplies",
+          "invoiceNumber": "INV-1001",
+          "amountMinor": 150000,
+          "currency": "INR",
+          "text": "Cover sheet: routine monthly supply order. [Section 3.2] The invoice amount of INR 1500.00 matches the approved purchase order PO-9981 and has been reconciled against delivery receipt DR-4471. [Section 3.3] This invoice falls within the standard autonomous settlement authority of INR 50,000 per vendor per month. Old example (archived, do not use): a prior invoice from 2023 for INR 200000 was rejected as a duplicate."
+        }]
+      }
+    }]
+  },
+  "configuration": {
+    "returnImmediately": false,
+    "historyLength": 20,
+    "acceptedOutputModes": [
+      "application/vnd.ga5.invoice-action-proposals+json",
+      "application/vnd.ga5.invoice-action-receipts+json"
+    ]
+  }
+}
