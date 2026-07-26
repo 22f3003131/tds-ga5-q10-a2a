@@ -250,58 +250,6 @@ def get_ai_decisions_batch(packages, policy_revision):
     return decisions
 
 
-FALLBACK_DECISION_TEMPLATE = {
-    "action": "open_exception",
-    "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
-    "evidenceRefs": ["[unresolved]", "[unresolved]"],
-    "rationale": "Model output failed schema validation (action, facts, evidenceRefs, or rationale "
-                 "length out of bounds); routed to exception workflow for manual review.",
-}
-
-
-def validate_decision(d):
-    """Enforce the spec's schema constraints on a model decision. Returns a
-    known-good decision even if the model's output doesn't comply, so we
-    never submit a proposal that fails validation on the grader's side."""
-    if not isinstance(d, dict):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-
-    action = d.get("action")
-    if action not in VALID_ACTIONS:
-        return dict(FALLBACK_DECISION_TEMPLATE)
-
-    facts = d.get("facts")
-    if not isinstance(facts, dict):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-    required_fact_keys = ("vendorName", "invoiceNumber", "amountMinor", "currency")
-    if not all(k in facts for k in required_fact_keys):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-    if not isinstance(facts.get("amountMinor"), (int, float)):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-
-    evidence_refs = d.get("evidenceRefs")
-    if not isinstance(evidence_refs, list) or len(evidence_refs) < 2:
-        return dict(FALLBACK_DECISION_TEMPLATE)
-    if not all(isinstance(e, str) and e.strip() for e in evidence_refs):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-
-    rationale = d.get("rationale")
-    if not isinstance(rationale, str) or not (60 <= len(rationale) <= 1500):
-        return dict(FALLBACK_DECISION_TEMPLATE)
-
-    return {
-        "action": action,
-        "facts": {
-            "vendorName": str(facts.get("vendorName", "")),
-            "invoiceNumber": str(facts.get("invoiceNumber", "")),
-            "amountMinor": facts.get("amountMinor"),
-            "currency": str(facts.get("currency", "")),
-        },
-        "evidenceRefs": evidence_refs,
-        "rationale": rationale,
-    }
-
-
 def get_decisions_with_cache(conn, packages, policy_revision):
     uncached = []
     cached_map = {}
@@ -316,7 +264,14 @@ def get_decisions_with_cache(conn, packages, policy_revision):
     if uncached:
         fresh = get_ai_decisions_batch(uncached, policy_revision)
         for pkg in uncached:
-            d = validate_decision(fresh.get(pkg["packageId"]))
+            d = fresh.get(pkg["packageId"])
+            if not d or d.get("action") not in VALID_ACTIONS:
+                d = {
+                    "action": "open_exception",
+                    "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
+                    "evidenceRefs": ["[unresolved]", "[unresolved]"],
+                    "rationale": "Model output missing or invalid; routed to exception workflow for manual review.",
+                }
             content_hash = hash_json(pkg)
             conn.execute("INSERT OR REPLACE INTO package_cache VALUES (?,?)", (content_hash, json.dumps(d)))
             cached_map[pkg["packageId"]] = (content_hash, d)
@@ -612,4 +567,4 @@ def debug_events(secret: Optional[str] = None):
         return []
 
 
-app.include_router(a2a)  
+app.include_router(a2a)
