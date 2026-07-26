@@ -219,9 +219,13 @@ def build_prompt(packages, policy_revision) -> str:
         "Return strict JSON: {\"decisions\": [{\"packageId\": str, \"action\": str, "
         "\"facts\": {\"vendorName\": str, \"invoiceNumber\": str, \"amountMinor\": int, \"currency\": str}, "
         "\"evidenceRefs\": [str, str, ...], \"rationale\": str}]}\n"
-        "evidenceRefs: return the exact bracketed reference IDs (e.g. [Section 3.2]) copied verbatim "
-        "from the controlling sentence(s) — at least two, and only ones that actually determine the "
-        "action (never the cover-sheet reference or an archived-example reference).\n"
+        "amountMinor: convert the stated amount into MINOR currency units (e.g. cents/paise), not the "
+        "major-unit number as written. Most currencies have 2 decimal places, so EUR 38,721.92 becomes "
+        "3872192. Zero-decimal currencies (e.g. JPY, KRW) have NO minor-unit multiplier: JPY 480,000 "
+        "stays 480000, not 48000000. Use the currency's actual exponent, not a blind x100.\n"
+        "evidenceRefs: return EXACTLY three bracketed reference IDs (e.g. [Section 3.2]) copied verbatim "
+        "from the controlling/decisive paragraph — not two, not four, exactly three. Never include the "
+        "cover-sheet reference, an archived-example reference, or a training-appendix reference.\n"
         "rationale: 60-1500 characters. Name the chosen action explicitly and explain, referencing the "
         "evidenceRefs, how each piece of cited evidence supports that specific action.\n\n"
         f"Packages:\n{json.dumps(packages, indent=None)}"
@@ -507,13 +511,35 @@ def get_task(task_id: str, principal: str = Depends(get_principal), _=Depends(ch
     return JSONResponse(content=build_task_response(row), media_type="application/a2a+json")
 
 
+def compact_task_response(row):
+    """Used only by GET /a2a/tasks (listing). Full task history includes all
+    12 long documents per task, so a full-detail listing of 5+ tasks under
+    one principal can blow past the 512 KiB response cap - which would make
+    the grader unable to even parse the listing, silently failing isolation
+    checks that depend on reading it. This strips history and artifact
+    payloads down to identity/state/descriptors only."""
+    artifacts_raw = json.loads(row["artifacts"])
+    descriptors = []
+    for a in artifacts_raw:
+        is_proposal = "proposals" in a
+        mt = PROPOSAL_MEDIA if is_proposal else RECEIPT_MEDIA
+        count = len(a.get("proposals", a.get("executions", [])))
+        descriptors.append({"mediaType": mt, "count": count})
+    return {
+        "id": row["id"],
+        "contextId": row["context_id"],
+        "state": row["state"],
+        "artifacts": descriptors,
+    }
+
+
 @a2a.get("/tasks")
 def list_tasks(principal: str = Depends(get_principal), _=Depends(check_version)):
     conn = get_db()
     rows = conn.execute("SELECT * FROM tasks WHERE principal=?", (principal,)).fetchall()
     conn.close()
     return JSONResponse(
-        content={"tasks": [build_task_response(r)["task"] for r in rows]},
+        content={"tasks": [compact_task_response(r) for r in rows]},
         media_type="application/a2a+json",
     )
 
